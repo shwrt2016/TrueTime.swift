@@ -171,7 +171,9 @@ private extension NTPClient {
     }
 
     func query(addresses: [SocketAddress], host: String) {
+        // 按IP地址组织结果：每个IP地址对应多个样本结果
         var results: [String: [FrozenNetworkTimeResult]] = [:]
+        
         connections = NTPConnection.query(addresses: addresses,
                                           config: config,
                                           logger: logger,
@@ -181,29 +183,44 @@ private extension NTPClient {
                 return
             }
 
-            let host = connection.address.host
-            results[host] = (results[host] ?? []) + [result]
+            // 使用完整的IP地址作为key，而不是host
+            let ipAddress = connection.address.host
+            results[ipAddress] = (results[ipAddress] ?? []) + [result]
 
-            let responses = Array(results.values)
-            let sampleSize = responses.map { $0.count }.reduce(0, +)
+            // 计算总样本数
+            let sampleSize = results.values.flatMap { $0 }.count
             let expectedCount = addresses.count * self.config.numberOfSamples
             let atEnd = sampleSize == expectedCount
-            let times = responses.map { results in
-                results.compactMap { try? $0.get() }
+
+            self.debugLog("Got \(sampleSize) out of \(expectedCount) samples from \(results.keys.count) IPs")
+
+            // 为每个IP地址筛选出最小延迟的响应
+            let bestTimePerIP = results.compactMap { (ip, samples) -> (String, FrozenNetworkTime)? in
+                let validTimes = samples.compactMap { try? $0.get() }
+                guard let bestTime = validTimes.min(by: { $0.serverResponse.delay < $1.serverResponse.delay }) else {
+                    return nil
+                }
+                self.debugLog("Best time for IP \(ip): δ=\(bestTime.serverResponse.delay)ms, θ=\(bestTime.serverResponse.offset)ms")
+                return (ip, bestTime)
             }
 
-            self.debugLog("Got \(sampleSize) out of \(expectedCount)")
-            if let time = bestTime(fromResponses: times) {
-                let time = FrozenNetworkTime(networkTime: time, sampleSize: sampleSize, host: host)
-                self.debugLog("\(atEnd ? "Final" : "Best") time: \(time), " +
-                              "δ: \(time.serverResponse.delay), " +
-                              "θ: \(time.serverResponse.offset)")
+            // 从所有IP的最佳响应中选择offset的中位数
+            if let selectedTime = self.selectMedianTimeByOffset(from: bestTimePerIP.map { $0.1 }) {
+                let selectedIP = bestTimePerIP.first { $0.1.time == selectedTime.time }?.0 ?? "unknown"
+                let finalTime = FrozenNetworkTime(networkTime: selectedTime, 
+                                                  sampleSize: sampleSize, 
+                                                  host: selectedIP)
+                
+                self.debugLog("\(atEnd ? "Final" : "Current best") time from IP \(selectedIP): " +
+                              "δ: \(finalTime.serverResponse.delay)ms, " +
+                              "θ: \(finalTime.serverResponse.offset)ms " +
+                              "(median from \(bestTimePerIP.count) IPs)")
 
-                let referenceTime = self.referenceTime ?? ReferenceTime(time)
+                let referenceTime = self.referenceTime ?? ReferenceTime(finalTime)
                 if self.referenceTime == nil {
                     self.referenceTime = referenceTime
                 } else {
-                    referenceTime.underlyingValue = time
+                    referenceTime.underlyingValue = finalTime
                 }
 
                 if atEnd {
@@ -212,16 +229,30 @@ private extension NTPClient {
                     self.updateProgress(.success(referenceTime))
                 }
             } else if atEnd {
+                // 所有请求都完成了但没有有效结果
                 let error: NSError
                 if case let .failure(failure) = result {
                     error = failure as NSError
                 } else {
                     error = NSError(trueTimeError: .noValidPacket)
                 }
-
                 self.finish(ReferenceTimeResult.failure(error))
             }
         }
+    }
+    
+    /// 从多个时间响应中选择offset的中位数
+    /// - Parameter times: 候选时间响应数组
+    /// - Returns: 选中的中位数时间，如果输入为空则返回nil
+    func selectMedianTimeByOffset(from times: [FrozenNetworkTime]) -> FrozenNetworkTime? {
+        guard !times.isEmpty else { return nil }
+        
+        // 按offset排序
+        let sortedTimes = times.sorted { $0.serverResponse.offset < $1.serverResponse.offset }
+        
+        // 返回中位数
+        let medianIndex = sortedTimes.count / 2
+        return sortedTimes[medianIndex]
     }
 
     func updateProgress(_ result: ReferenceTimeResult) {
